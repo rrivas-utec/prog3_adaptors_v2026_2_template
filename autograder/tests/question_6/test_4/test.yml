@@ -1,0 +1,5 @@
+weight: 0.9
+name: "Question #6.4"
+message: 'Su programa no satisface las condiciones de prueba.'
+show_output: true
+required_files: [include/browser_history.h, src/browser_history.cpp]

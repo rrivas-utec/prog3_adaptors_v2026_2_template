@@ -1,0 +1,5 @@
+weight: 0.8
+name: "Question #7.1"
+message: 'Su programa no satisface las condiciones de prueba.'
+show_output: true
+required_files: [include/validate_tags.h, src/validate_tags.cpp]

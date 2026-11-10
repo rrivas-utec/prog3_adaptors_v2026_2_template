@@ -1,0 +1,501 @@
+#!/usr/bin/env python3
+import grade_util as gu
+import bootstrap
+import shutil
+import os
+import stat
+import glob
+import yaml
+import json
+import math
+import re
+import subprocess
+import unittest
+import logging
+from typing import List
+from dateutil import parser
+
+from gradescope_utils.autograder_utils.decorators import weight, visibility
+from gradescope_utils.autograder_utils.json_test_runner import JSONTestRunner
+
+logging.basicConfig()
+LOGGER = logging.getLogger('autograder')
+LOGGER.setLevel(logging.INFO)
+
+ZERO_LEADERBOARD = [
+    {
+        'name': 'Score',
+        'value': 0
+    }
+]
+
+
+def ZERO_RESULT(msg):
+    return {
+        'score': 0.0,
+        'stdout_visibility': 'hidden',
+        'output': msg,
+        'leaderboard': ZERO_LEADERBOARD
+    }
+
+
+def BAD_FORMAT(file):
+    return ZERO_RESULT('❌ Required file not submitted: \'{0}\'.'.format(file))
+
+
+def SUBMISSIONS_EXCEEDED(limit):
+    return ZERO_RESULT('❌ Exceeded maximum number of submissions: {}'.format(limit))
+
+
+def NUM_SUBMISSIONS_INFO(num, limit):
+    return ZERO_RESULT('❌ Submission {} out of {}'.format(num, limit))
+
+
+#  class used in generating unittest TestCase's
+class Test(type):
+
+    def __new__(mcs, test, bases, attrs):
+        attrs[test.__doc__] = test
+        return super(Test, mcs).__new__(mcs, test.__doc__, bases, attrs)
+
+
+def get_test_dirs() -> List[str]:
+    '''
+    Returns a list of directory paths, as strings, for each test contained in 'tests' directory
+    '''
+    return [dr[:-1] for dr in glob.glob(gu.Config.TEST_DIR + '/*/')]
+
+
+def load_yaml(file: str):
+    try:
+        with open(file, 'r') as f:
+            return yaml.safe_load(f) or {}
+    except FileNotFoundError:
+        return {}
+
+
+def resolve_submission_file(relative_file: str):
+    expected = relative_file.replace('\\', '/').lower()
+    matches = []
+    for root, _, files in os.walk(gu.Config.SUBMITTED_SOURCE):
+        for filename in files:
+            candidate = os.path.relpath(os.path.join(root, filename), gu.Config.SUBMITTED_SOURCE)
+            if candidate.replace('\\', '/').lower() == expected:
+                matches.append(os.path.join(root, filename))
+    if len(matches) > 1:
+        LOGGER.error('Ambiguous submission files for %s: %s', relative_file, matches)
+        return None
+    return matches[0] if matches else None
+
+
+def forbidden_include_violations(forbidden_includes):
+    forbidden = {item.strip().lower() for item in forbidden_includes}
+    pattern = re.compile(r'^\s*#\s*include\s*[<"]([^>"]+)[>"]')
+    violations = []
+    for root, _, files in os.walk(gu.Config.SUBMITTED_SOURCE):
+        for filename in files:
+            if not filename.endswith(('.h', '.hpp', '.cpp', '.cc', '.cxx')):
+                continue
+            path = os.path.join(root, filename)
+            with open(path, encoding='utf-8', errors='replace') as source:
+                for line_number, line in enumerate(source, start=1):
+                    match = pattern.match(line)
+                    if match and match.group(1).strip().lower() in forbidden:
+                        violations.append('{}:{} includes <{}>'.format(filename, line_number, match.group(1)))
+    return violations
+
+
+def copy_submission_file_to_test_layout(relative_file: str, src_file: str):
+
+    # 1) keep original folder structure so required_files like include/... can be validated
+    tree_dest = os.path.join(gu.Config.TEST_DIR, relative_file)
+    parent_dir = os.path.dirname(tree_dest)
+    if parent_dir:
+        os.makedirs(parent_dir, exist_ok=True)
+    shutil.copy(src_file, tree_dest)
+
+    # 2) also copy flat at tests root for scripts that include by basename
+    flat_dest = os.path.join(gu.Config.TEST_DIR, os.path.basename(relative_file))
+    shutil.copy(src_file, flat_dest)
+
+    # 3) copy flat into each question_* directory because question run_test uses -I ../../
+    for question_dir in glob.glob(os.path.join(gu.Config.TEST_DIR, 'question_*')):
+        if os.path.isdir(question_dir):
+            shutil.copy(src_file, os.path.join(question_dir, os.path.basename(relative_file)))
+
+
+def strip_cpp_comments(contents: str) -> str:
+    contents = re.sub(r'/\*.*?\*/', '', contents, flags=re.DOTALL)
+    contents = re.sub(r'//[^\r\n]*', '', contents)
+    return re.sub(r'^\s*#.*$', '', contents, flags=re.MULTILINE)
+
+
+def source_file_is_skeleton(relative_file: str) -> bool:
+    """Return True when a required source file has not received code yet."""
+    source_path = os.path.join(gu.Config.TEST_DIR, relative_file)
+    try:
+        with open(source_path, encoding='utf-8', errors='replace') as source:
+            contents = source.read()
+    except FileNotFoundError:
+        return False
+
+    if 'AUTOGRADER: INCOMPLETE' in contents:
+        return True
+
+    # Older generated projects do not contain the explicit marker. A source
+    # made only of comments, #include directives, and whitespace is the same
+    # starter skeleton and cannot be meaningfully tested yet.
+    return not strip_cpp_comments(contents).strip()
+
+
+def pending_implementation_files(question):
+    implementation_files = question.get('implementation_files')
+    if implementation_files is None:
+        source_files = [
+            file for file in question.get('required_files', [])
+            if file.lower().endswith(('.cpp', '.cc', '.cxx'))
+        ]
+        # Questions with a required translation unit are implemented in that
+        # source file.  Otherwise they are header-only (templates, inline
+        # functions, and similar exercises), so the public header itself is
+        # the implementation file whose starter skeleton must be detected.
+        implementation_files = source_files or [
+            file for file in question.get('required_files', [])
+            if file.lower().endswith(('.h', '.hpp'))
+        ]
+    return [file for file in implementation_files if source_file_is_skeleton(file)]
+
+
+def missing_required_symbols(question):
+    required_symbols = question.get('required_symbols', [])
+    if not required_symbols:
+        return []
+    header = question.get('header')
+    if not header:
+        header = next(
+            (
+                required_file.removeprefix('include/')
+                for required_file in question.get('required_files', [])
+                if required_file.startswith('include/')
+            ),
+            None,
+        )
+    if not header:
+        return required_symbols
+    header_path = os.path.join(gu.Config.TEST_DIR, 'include', header)
+    try:
+        with open(header_path, encoding='utf-8', errors='replace') as header:
+            header_contents = strip_cpp_comments(header.read())
+    except FileNotFoundError:
+        return required_symbols
+    return [symbol for symbol in required_symbols if symbol not in header_contents]
+
+
+def generate_test(dir_name):
+    settings = load_yaml(os.path.join(gu.Config.TEST_DIR, dir_name, 'test.yml'))
+    LOGGER.info('⚡ Generating test \'{}\''.format(settings.get('name', '')))
+
+    def run_test():
+        run_path = os.path.join(gu.Config.TEST_DIR, dir_name, 'run_test')
+        os.chmod(run_path, os.stat(run_path).st_mode | stat.S_IEXEC)
+        subprocess.check_call(['dos2unix', 'run_test'], cwd=os.path.join(gu.Config.TEST_DIR, dir_name),
+                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        subprocess.check_output(['./run_test'], cwd=os.path.join(gu.Config.TEST_DIR, dir_name),
+                                stderr=subprocess.STDOUT, timeout=settings.get('timeout', None))
+
+    @weight(settings.get('weight', 1))
+    @visibility(settings.get('visibility', 'visible'))
+    def wrapper(self):
+        show_output = settings.get('show_output', True)
+        try:
+            run_test()
+        except subprocess.CalledProcessError as e:  # test script returned non-zero
+            msg = '{}\n\n{}'.format(settings.get('message', ''),
+                                    e.output.decode() if show_output else '')
+            raise Exception(msg)
+        except subprocess.TimeoutExpired as e:
+            msg = '{}\n\n{}'.format('❌ Test timed out', e.output.decode() if show_output else '')
+            raise Exception(msg)
+
+    wrapper.__doc__ = '{}'.format(settings.get('name', os.path.basename(dir_name)))
+    return wrapper
+
+
+def generate_missing_required_files_test(dir_name, settings, missing_files):
+    missing_files_message = ', '.join(missing_files)
+
+    @weight(settings.get('weight', 1))
+    @visibility(settings.get('visibility', 'visible'))
+    def wrapper(self):
+        raise Exception(
+            'Required file(s) not submitted or not copied into the test layout: {}'.format(
+                missing_files_message
+            )
+        )
+
+    wrapper.__doc__ = '{}'.format(settings.get('name', os.path.basename(dir_name)))
+    return wrapper
+
+
+def generate_missing_question_test(question):
+    missing_files_message = ', '.join(question['missing_files'])
+
+    @weight(question['weight'])
+    @visibility('visible')
+    def wrapper(self):
+        raise Exception(
+            'Question #{} was not evaluated because required file(s) are missing: {}'.format(
+                question['id'], missing_files_message
+            )
+        )
+
+    wrapper.__doc__ = 'Question #{} - missing implementation'.format(question['id'])
+    return wrapper
+
+
+def generate_pending_implementation_test(question):
+    pending_files_message = ', '.join(question['pending_files'])
+
+    @weight(question['weight'])
+    @visibility('visible')
+    def wrapper(self):
+        raise Exception(
+            'Question #{} was not evaluated because its source file(s) still contain only the starter skeleton: {}. '
+            'Implement the requested code and submit again; its tests will then run automatically.'.format(
+                question['id'], pending_files_message
+            )
+        )
+
+    wrapper.__doc__ = 'Question #{} - implementation pending'.format(question['id'])
+    return wrapper
+
+
+def generate_missing_interface_test(question):
+    missing_symbols_message = ', '.join(question['missing_symbols'])
+
+    @weight(question['weight'])
+    @visibility('visible')
+    def wrapper(self):
+        raise Exception(
+            'Question #{} was not evaluated because its required interface is incomplete. '
+            'Add the missing class, function, or template declaration(s) to include/{}: {}. '
+            'Its tests will run automatically after that.'.format(
+                question['id'], question['header'], missing_symbols_message
+            )
+        )
+
+    wrapper.__doc__ = 'Question #{} - interface pending'.format(question['id'])
+    return wrapper
+
+
+def question_id_from_test_dir(dir_name):
+    match = re.search(r'(?:^|/)question_(\d+)(?:/|$)', dir_name.replace('\\', '/'))
+    return int(match.group(1)) if match else None
+
+
+def run_test(root, dr, suite):
+    LOGGER.info('ℹ️ Test directory discovered: {}'.format(dr))
+    run_test_path = os.path.join(gu.Config.TEST_DIR, dr, 'run_test')
+    if not gu.file_exists(run_test_path):
+        LOGGER.error('❌ Test improperly configured: missing \'run_test\' executable')
+        exit(-1)
+
+    test_yml_path = os.path.join(gu.Config.TEST_DIR, dr, 'test.yml')
+    test_yml = load_yaml(test_yml_path)
+
+    required_files = test_yml.get('required_files', [])
+    if len(required_files) > 0:
+        missing_files = []
+        for file in required_files:
+            if not os.path.isfile(os.path.join(gu.Config.TEST_DIR, file)):
+                missing_files.append(file)
+
+        if missing_files:
+            LOGGER.error('❌ Required files not found in test directory: {}'.format(', '.join(missing_files)))
+            test_fn = generate_missing_required_files_test(dr, test_yml, missing_files)
+            t = Test(test_fn, (unittest.TestCase,), {})
+            suite.addTest(t(test_fn.__doc__))
+            return
+    else:
+        LOGGER.warning(f'⚠️ The attribute \'required_files\' is empty in \'test.yml\' of {dr}')
+
+    test_fn = generate_test(dr)
+    t = Test(test_fn, (unittest.TestCase,), {})
+    suite.addTest(t(test_fn.__doc__))
+
+
+def run_tests(pending_messages, blocked_questions):
+    suite = unittest.TestSuite()
+
+    blocked_question_ids = {question['id'] for question in blocked_questions}
+    for question in blocked_questions:
+        if question['status'] == 'missing':
+            test_fn = generate_missing_question_test(question)
+        elif question['status'] == 'pending':
+            test_fn = generate_pending_implementation_test(question)
+        else:
+            test_fn = generate_missing_interface_test(question)
+        t = Test(test_fn, (unittest.TestCase,), {})
+        suite.addTest(t(test_fn.__doc__))
+
+    test_dirs = get_test_dirs()
+    if len(test_dirs) == 0:
+        LOGGER.info('❌ Test directories have not been found')
+        exit(-1)
+
+    test_dirs.sort()
+
+    #  go through all directories in /tests
+    for dr in test_dirs:
+        if blocked_questions and dr in ('asan_leaksan', 'clang_tidy'):
+            LOGGER.info('Skipping static analysis until all required question files are implemented')
+            continue
+        run_test_path = os.path.join(gu.Config.TEST_DIR, dr, 'run_test')
+        if gu.file_exists(run_test_path):
+            LOGGER.info('ℹ️ Root of Test directory: {}'.format(dr))
+            run_test(gu.Config.TEST_DIR, dr, suite)
+        else:
+            LOGGER.info('ℹ️ Root of Test directory: {}'.format(dr))
+            nested_run_tests = glob.glob(os.path.join(dr, '**', 'run_test'), recursive=True)
+            if len(nested_run_tests) == 0:
+                LOGGER.info('ℹ️ Skipping non-test directory: {}'.format(dr))
+                continue
+
+            for nested_run_test in nested_run_tests:
+                nested_dir = os.path.dirname(nested_run_test)
+                if question_id_from_test_dir(nested_dir) in blocked_question_ids:
+                    continue
+                run_test(gu.Config.TEST_DIR, nested_dir, suite)
+
+    with open(gu.Config.RESULTS_FILE, 'w+') as result_stream:
+        JSONTestRunner(stdout_visibility='hidden', stream=result_stream).run(suite)
+
+        LOGGER.info('ℹ️ Adding final score to leaderboard')
+        result_stream.seek(0)  # reset file pointer
+        data = json.load(result_stream)  # load contents to JSON
+
+        with open(gu.Config.SUBMISSION_META_FILE, 'r') as submission_stream:
+            meta = json.load(submission_stream)
+
+        due = parser.isoparse(meta['assignment']['due_date'])
+        submitted = parser.isoparse(meta['created_at'])
+
+        # Penalizando Notas
+        original = data.get('score', 0)
+
+        # Calcular días de retraso
+        delta = submitted - due
+
+        # Si es negativo, days_late = 0
+        days_late = max(0, math.ceil(delta.total_seconds() / (24 * 3600)))
+
+        if days_late > 0:
+            # 4. Penalización lineal: 25% por día
+            penalty_factor = max(1 - 0.25 * days_late, 0)
+            penalized_score = round(original * penalty_factor, 2)
+
+            # 5. Actualizar resultados
+            data['score'] = penalized_score
+
+            # 6. Añadir nota explicativa
+            pct_penalty = min(days_late * 25, 100)
+            note = (
+                f"⚠️ Late submission: {days_late} day(s) late → "
+                f"{pct_penalty}% penalty applied (score scaled by {penalty_factor:.2f})."
+            )
+            data['stdout'] = (data.get('stdout', '') or '') + '\n' + note
+            LOGGER.info(note)
+
+        # Registrando Lideres
+        final_score = data.get('score', 0)
+        data['leaderboard'] = [{'name': 'Score', 'value': final_score}]
+
+        LOGGER.info('ℹ️ Prepending additional messages to output')
+        if 'tests' not in data:
+            data['tests'] = []
+        for msg in pending_messages:
+            data['tests'].insert(0, msg)
+        result_stream.truncate(0)
+        result_stream.seek(0)
+
+        json.dump(data, result_stream)  # rewrite JSON to file
+
+
+#  Execution begins here
+if __name__ == '__main__':
+    bootstrap.init()
+
+    pending_messages = []
+    LOGGER.info('⚡ Loading config.yml file')
+    config = load_yaml('config.yml')
+
+    limit = config.get('limit_submissions', -1)
+    LOGGER.info('⚡ Using submission limit: {}'.format(limit))
+    if limit != -1:
+        num_submissions = gu.number_submissions() + 1
+        if num_submissions > limit:
+            LOGGER.info('ℹ️ Submission limit reached. Observed submissions: {}'.format(num_submissions))
+            gu.write_result(**SUBMISSIONS_EXCEEDED(limit))
+            exit(0)
+        else:
+            pending_messages.append((NUM_SUBMISSIONS_INFO(num_submissions, limit)))
+
+    submitted_files = config.get('required_files', []) + config.get('optional_files', [])
+    for file in dict.fromkeys(submitted_files):
+        LOGGER.info('⚡ Attempting to load file: {}'.format(file))
+        submitted_file = resolve_submission_file(file)
+        if submitted_file:
+            LOGGER.info('⚡ Copying file to test directories: {}'.format(file))
+            copy_submission_file_to_test_layout(file, submitted_file)
+
+    violations = forbidden_include_violations(config.get('forbidden_includes', []))
+    if violations:
+        gu.write_result(**ZERO_RESULT('Forbidden #include directive(s): ' + '; '.join(violations)))
+        exit(0)
+
+    blocked_questions = []
+    for question in config.get('questions', []):
+        missing_files = [
+            file for file in question.get('required_files', [])
+            if not os.path.isfile(os.path.join(gu.Config.TEST_DIR, file))
+        ]
+        if missing_files:
+            blocked_questions.append({
+                'id': question['id'],
+                'weight': question['weight'],
+                'missing_files': missing_files,
+                'status': 'missing',
+            })
+            continue
+
+        pending_files = pending_implementation_files(question)
+        if pending_files:
+            blocked_questions.append({
+                'id': question['id'],
+                'weight': question['weight'],
+                'pending_files': pending_files,
+                'status': 'pending',
+            })
+            continue
+
+        missing_symbols = missing_required_symbols(question)
+        if missing_symbols:
+            blocked_questions.append({
+                'id': question['id'],
+                'weight': question['weight'],
+                'header': question.get(
+                    'header',
+                    next(
+                        (
+                            required_file.removeprefix('include/')
+                            for required_file in question.get('required_files', [])
+                            if required_file.startswith('include/')
+                        ),
+                        'the required header',
+                    ),
+                ),
+                'missing_symbols': missing_symbols,
+                'status': 'interface',
+            })
+
+    run_tests(pending_messages, blocked_questions)

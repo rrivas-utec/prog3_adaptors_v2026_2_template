@@ -1,0 +1,10 @@
+//
+// Created by rudri on 10/11/2020.
+//
+
+#ifndef PROG3_ADAPTORS_V2026_2_JOIN_STACKS_H
+#define PROG3_ADAPTORS_V2026_2_JOIN_STACKS_H
+
+
+
+#endif //PROG3_ADAPTORS_V2026_2_JOIN_STACKS_H

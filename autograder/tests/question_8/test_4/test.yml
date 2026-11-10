@@ -1,0 +1,5 @@
+weight: 0.9
+name: "Question #8.4"
+message: 'Su programa no satisface las condiciones de prueba.'
+show_output: true
+required_files: [include/evaluate_postfix.h, src/evaluate_postfix.cpp]

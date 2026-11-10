@@ -1,0 +1,98 @@
+limit_submissions: -1
+required_files: 
+  - include/merge_stacks.h
+  - include/join_stacks.h
+  - include/process_text_by_stack.h
+  - include/process_text_by_queue.h
+  - include/is_equation_balanced.h
+  - include/browser_history.h
+  - include/validate_tags.h
+  - include/evaluate_postfix.h
+  - include/stack_utec.h
+  - include/queue_utec.h
+  - include/adaptor_concepts.h
+  - src/process_text_by_stack.cpp
+  - src/process_text_by_queue.cpp
+  - src/is_equation_balanced.cpp
+  - src/browser_history.cpp
+  - src/validate_tags.cpp
+  - src/evaluate_postfix.cpp
+optional_files:  []
+questions:
+  - id: 1
+    weight: 1.7
+    header: merge_stacks.h
+    required_files:
+      - include/merge_stacks.h
+    required_symbols:
+      - utec::stack
+      - merge_stacks
+  - id: 2
+    weight: 1.7
+    header: join_stacks.h
+    required_files:
+      - include/join_stacks.h
+    required_symbols:
+      - utec::stack
+      - join_stacks
+  - id: 3
+    weight: 1.7
+    header: process_text_by_stack.h
+    required_files:
+      - include/process_text_by_stack.h
+      - src/process_text_by_stack.cpp
+    required_symbols:
+      - process_text_by_stack
+  - id: 4
+    weight: 1.7
+    header: process_text_by_queue.h
+    required_files:
+      - include/process_text_by_queue.h
+      - src/process_text_by_queue.cpp
+    required_symbols:
+      - process_text_by_queue
+  - id: 5
+    weight: 3.3
+    header: is_equation_balanced.h
+    required_files:
+      - include/is_equation_balanced.h
+      - src/is_equation_balanced.cpp
+    required_symbols:
+      - is_equation_balanced
+  - id: 6
+    weight: 3.3
+    header: browser_history.h
+    required_files:
+      - include/browser_history.h
+      - src/browser_history.cpp
+    required_symbols:
+      - BrowserMemento
+      - Browser
+      - BrowserHistory
+      - visit
+      - set_scroll
+      - current
+      - scroll
+      - save
+      - restore
+      - back
+      - forward
+      - utec::stack
+  - id: 7
+    weight: 3.3
+    header: validate_tags.h
+    required_files:
+      - include/validate_tags.h
+      - src/validate_tags.cpp
+    required_symbols:
+      - string
+      - validate_tags
+  - id: 8
+    weight: 3.3
+    header: evaluate_postfix.h
+    required_files:
+      - include/evaluate_postfix.h
+      - src/evaluate_postfix.cpp
+    required_symbols:
+      - evaluate_postfix
+forbidden_includes:  []

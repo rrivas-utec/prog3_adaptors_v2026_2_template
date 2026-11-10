@@ -1,0 +1,11 @@
+#pragma once
+#include "include/stack_utec.h"
+#include "include/queue_utec.h"
+#include "include/merge_stacks.h"
+#include "include/join_stacks.h"
+#include "include/process_text_by_stack.h"
+#include "include/process_text_by_queue.h"
+#include "include/is_equation_balanced.h"
+#include "include/browser_history.h"
+#include "include/validate_tags.h"
+#include "include/evaluate_postfix.h"

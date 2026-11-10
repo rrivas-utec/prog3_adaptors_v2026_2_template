@@ -1,0 +1,5 @@
+weight: 0.4
+name: "Question #3.2"
+message: 'Su programa no satisface las condiciones de prueba.'
+show_output: true
+required_files: [include/process_text_by_stack.h, src/process_text_by_stack.cpp]
